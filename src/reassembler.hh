@@ -46,6 +46,9 @@ public:
   void add_to_buffer(uint64_t start,const string& data);
   void flush_buffer_to_output();
   void check_and_close();
+  void set_error(){
+    output_.writer().set_error();
+  }
 private:
   ByteStream output_; // the Reassembler writes to this ByteStream
   uint64_t next_index = 0;

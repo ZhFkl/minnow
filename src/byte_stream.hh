@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <vector>
+
 class Reader;
 class Writer;
 
@@ -20,15 +20,15 @@ public:
 
   void set_error() { error_ = true; };       // Signal that the stream suffered an error.
   bool has_error() const { return error_; }; // Has the stream had an error?
+
 protected:
   // Please add any additional state to the ByteStream here, and not to the Writer and Reader interfaces.
   uint64_t capacity_;
-  std::string buffer_{};
-  uint64_t available_capacity_{};
-  bool is_closed_ = false;
-  uint64_t pushed{};
-  uint64_t poped{};
-  bool error_ {};
+  bool error_ {false};
+  bool is_close {false};
+  std::string buffer;
+  uint32_t pushed = 0;
+  uint32_t poped = 0;
 };
 
 class Writer : public ByteStream
@@ -45,8 +45,8 @@ public:
 class Reader : public ByteStream
 {
 public:
-  std::string_view peek() const; // Peek at the next bytes in the buffer -- ideally as many as possible.
-  void pop( uint64_t len );      // Remove `len` bytes from the buffer.
+  std::string_view peek() const; // Peek at the next bytes in the buffer
+  void pop( uint64_t len );      // Remove `len` bytes from the buffer
 
   bool is_finished() const;        // Is the stream finished (closed and fully popped)?
   uint64_t bytes_buffered() const; // Number of bytes currently buffered (pushed and not popped)
@@ -54,7 +54,7 @@ public:
 };
 
 /*
- * read: A (provided) helper function thats peeks and pops up to `max_len` bytes
+ * read: A (provided) helper function thats peeks and pops up to `len` bytes
  * from a ByteStream Reader into a string;
  */
-void read( Reader& reader, uint64_t max_len, std::string& out );
+void read( Reader& reader, uint64_t len, std::string& out );

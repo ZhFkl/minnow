@@ -6,8 +6,7 @@
 
 using namespace std;
 
-int main()
-{
+int main(){
   try {
     {
       ReassemblerTestHarness test { "all within capacity", 2 };

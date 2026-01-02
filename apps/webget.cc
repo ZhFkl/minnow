@@ -1,5 +1,5 @@
 #include "debug.hh"
-#include "socket.hh"
+#include "tcp_minnow_socket.hh"
 
 #include <cstdlib>
 #include <iostream>
@@ -15,7 +15,7 @@ void get_URL( const string& host, const string& path )
 
   printf( "get_url test \n" );
   Address address( host, "http" );
-  TCPSocket socket;
+  CS144TCPSocket socket;
   // 和服务器连接
   socket.connect( address );
   // request
@@ -30,6 +30,7 @@ void get_URL( const string& host, const string& path )
     cout << buf;
   }
   socket.close();
+  socket.wait_until_closed();
   return;
   debug( "Function called: get_URL( \"{}\", \"{}\" )", host, path );
   debug( "get_URL() function not yet implemented" );

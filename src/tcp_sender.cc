@@ -4,96 +4,129 @@
 
 using namespace std;
 
-// How many sequence numbers are outstanding?
-uint64_t TCPSender::sequence_numbers_in_flight() const
-{
-  return in_flight_;
-  debug( "unimplemented sequence_numbers_in_flight() called" );
-  return {};
-}
+uint64_t TCPSender::sequence_numbers_in_flight() const { return in_flight_; }
 
-// How many consecutive retransmissions have happened?
-uint64_t TCPSender::consecutive_retransmissions() const
-{
-  return consecutive_rexmit_cnt_;
-  debug( "unimplemented consecutive_retransmissions() called" );
-  return {};
-}
+uint64_t TCPSender::consecutive_retransmissions() const { return consecutive_rexmit_cnt_; }
 
 void TCPSender::push( const TransmitFunction& transmit )
 {
-  auto available_space = static_cast<uint64_t>(window_size_) - in_flight_;
-  // send SYN if not sent
-  if(available_space == 0){
-    debug("window is full, cannot send data now");
-    return ;
+  // 1. 检查流错误，发送 RST 并立即返回 (不重传 RST)
+  if (input_.writer().has_error()) {
+    TCPSenderMessage rst_msg;
+    rst_msg.seqno = Wrap32::wrap(next_seq_, isn_);
+    rst_msg.SYN = false;
+    rst_msg.FIN = false;
+    rst_msg.RST = true;
+    transmit(rst_msg);
+    return;
   }
-  while(available_space > 0 ){
 
+  // 2. 防止下溢：计算可用窗口
+  uint64_t current_window_size = (window_size_ == 0) ? 1 : window_size_;
+  uint64_t available_space = 0;
+  if (current_window_size > in_flight_) {
+      available_space = current_window_size - in_flight_;
+  }
+
+  // 3. 填充窗口循环
+  while (available_space > 0) {
     TCPSenderMessage msg;
     msg.SYN = false;
     msg.FIN = false;
+    msg.RST = false;
 
-    if(input_.writer().has_error()){
-      msg.RST = true;
-    }else{
-      msg.RST = false;
-    }
-
-    if(!syn_sent_ && available_space > 0){
+    // 处理 SYN
+    if (!syn_sent_) {
       msg.SYN = true;
       syn_sent_ = true;
-      available_space -= 1;
+      available_space--;
     }
 
+    // 计算 Payload (注意这里 MSS 的使用，如果 TCPConfig 可用建议替换 mss_)
+    uint64_t payload_size = std::min({mss_, available_space, input_.reader().bytes_buffered()});
+    msg.payload = input_.reader().peek().substr(0, payload_size);
+    input_.reader().pop(payload_size);
+    available_space -= payload_size;
 
-    uint64_t max_data_len = std::min({
-        mss_,
-        available_space,
-        input_.reader().bytes_buffered()
-    });
-
-    msg.payload = input_.reader().peek().substr(0, max_data_len);
-    input_.reader().pop(max_data_len);
-    available_space -= max_data_len;
-    // if the input stream is not ended and we should use a while loop to 
-    // push more data to the segment
-
-    if(!fin_sent_ && input_.reader().is_finished() 
-      && available_space > 0 && input_.writer().is_closed()){
-        msg.FIN = true;
-        fin_sent_ = true;
-        available_space -= 1;
+    // 处理 FIN (只有在空间允许且流结束时)
+    if (!fin_sent_ && input_.reader().is_finished() && available_space > 0) {
+      msg.FIN = true;
+      fin_sent_ = true;
+      available_space--;
     }
-
 
     msg.seqno = Wrap32::wrap(next_seq_, isn_);
 
-    if(msg.sequence_length() == 0 && !msg.RST){
-      // nothing to send
-      return ;
+    // 如果没有任何东西发送 (长度为0且不是RST)，退出循环
+    if (msg.sequence_length() == 0) {
+      break;
     }
+
+    // 发送并更新状态
     transmit(msg);
     next_seq_ += msg.sequence_length();
     in_flight_ += msg.sequence_length();
     rexmit_queue_.push(msg);
-    // start rto timer if not running
-    if(!timer_running_){
+
+    // 只有在定时器未运行时才启动
+    if (!timer_running_) {
       timer_running_ = true;
       time_elapsed_ = 0;
     }
 
-    if(fin_sent_ || available_space == 0 || msg.RST){
+    // 如果发送了 FIN 或者窗口满了，停止
+    if (fin_sent_ || available_space == 0) {
       break;
     }
+  }
+}
 
-
+void TCPSender::receive( const TCPReceiverMessage& msg )
+{
+  if (msg.RST) {
+      input_.writer().set_error();
+      // 这里不需要清空队列或者重置定时器，因为连接已经断了
+      // 但清空也是安全的防御性编程
+      return; 
   }
 
+  // 更新窗口大小 (即使没有 ACK 新数据，窗口也可能更新)
+  raw_window_size_ = msg.window_size;
+  window_size_ = (msg.window_size == 0) ? 1 : msg.window_size;
 
+  if (msg.ackno.has_value()) {
+    uint64_t abs_ackno = msg.ackno.value().unwrap(isn_, acked_seq_);
 
-  debug( "unimplemented push() called" );
-  (void)transmit;
+    // 检查 ACK 合法性：不能小于已确认的，也不能大于已发送的
+    if (abs_ackno > next_seq_ || abs_ackno <= acked_seq_) {
+      return;
+    }
+
+    // 更新 in_flight 和 acked_seq
+    in_flight_ -= (abs_ackno - acked_seq_);
+    acked_seq_ = abs_ackno;
+
+    // 清理重传队列
+    while (!rexmit_queue_.empty()) {
+      const auto &front_msg = rexmit_queue_.front();
+      // 这里的 checkpoint 用 acked_seq_ 更自然
+      uint64_t msg_end = front_msg.seqno.unwrap(isn_, acked_seq_) + front_msg.sequence_length();
+      
+      if (msg_end <= acked_seq_) {
+        rexmit_queue_.pop();
+      } else {
+        break;
+      }
+    }
+
+    // RFC 6298: 有新数据被确认时，重置 RTO
+    current_RTO_ms_ = initial_RTO_ms_;
+    consecutive_rexmit_cnt_ = 0;
+    time_elapsed_ = 0;
+
+    // 如果还有未确认数据，重启定时器(通过置0已完成)；如果没有，关闭定时器
+    timer_running_ = !rexmit_queue_.empty();
+  }
 }
 
 
@@ -110,68 +143,7 @@ TCPSenderMessage TCPSender::make_empty_message() const
   msg.payload = "";
   msg.seqno = Wrap32::wrap(next_seq_, isn_);
   return msg;
-
-  debug( "unimplemented make_empty_message() called" );
-  return {};
 }
-
-void TCPSender::receive( const TCPReceiverMessage& msg )
-{
-  if (msg.RST) {
-        input_.writer().set_error();
-        while (!rexmit_queue_.empty()) {
-            rexmit_queue_.pop();
-        }
-        timer_running_ = false;
-        time_elapsed_ = 0;
-        return; 
-  }
-  if(!input_.writer().has_error()){
-    raw_window_size_ = msg.window_size;
-    window_size_ = (msg.window_size == 0) ? 1 : msg.window_size;
-    if(msg.ackno.has_value()){
-      //which means the ack is valid then we get the ackno and rto
-
-      uint64_t abs_ackno = msg.ackno.value().unwrap(isn_, acked_seq_);
-
-      if(abs_ackno <= acked_seq_ || abs_ackno > next_seq_){
-        //invalid ackno 
-        return;
-      }
-      in_flight_ = in_flight_ - (abs_ackno - acked_seq_);
-      acked_seq_ = abs_ackno;
-      while(!rexmit_queue_.empty()){
-        const auto& front_msg = rexmit_queue_.front();
-        uint64_t msg_end = front_msg.seqno.unwrap(isn_,acked_seq_) + front_msg.sequence_length();
-        
-        // check if the front msg is acked
-        if(msg_end <= acked_seq_){
-          rexmit_queue_.pop();
-        }else{
-          break;
-        }
-      }
-
-      // reset rto timer and consecutive rexmit cnt
-      consecutive_rexmit_cnt_ = 0;
-      // reset RTO timer
-      current_RTO_ms_ = initial_RTO_ms_;
-
-      if(rexmit_queue_.empty()){
-        timer_running_ = false;
-        time_elapsed_ = 0;
-      }else{
-        time_elapsed_ = 0;
-      }
-
-    } 
-  }
-
-  debug( "unimplemented receive() called" );
-  (void)msg;
-}
-
-
 
 
 void TCPSender::tick( uint64_t ms_since_last_tick, const TransmitFunction& transmit )
@@ -202,7 +174,6 @@ void TCPSender::tick( uint64_t ms_since_last_tick, const TransmitFunction& trans
   }
 
 
-  debug( "unimplemented tick({}, ...) called", ms_since_last_tick );
   (void)transmit;
 }
 

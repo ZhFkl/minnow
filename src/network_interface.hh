@@ -3,7 +3,7 @@
 #include "address.hh"
 #include "ethernet_frame.hh"
 #include "ipv4_datagram.hh"
-
+#include <map>
 #include <memory>
 #include <queue>
 
@@ -67,6 +67,22 @@ public:
   std::queue<InternetDatagram>& datagrams_received() { return datagrams_received_; }
 
 private:
+  struct ArpEntry{
+    EthernetAddress mac;
+    size_t expiration_time;
+  };
+
+  // ARP table mapping IPv4 addresses to Ethernet addresses
+  std::map<uint32_t, ArpEntry> arp_table_{}; 
+
+
+  // Datagrams waiting for ARP resolution and go to the next hop
+  std::map<uint32_t,std::vector<InternetDatagram>> waiting_datagrams_{};
+
+  std::map<uint32_t,size_t> arp_request_timers_{};
+  size_t current_time_ = 0;
+
+
   // Human-readable name of the interface
   std::string name_;
 

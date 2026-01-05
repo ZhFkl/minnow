@@ -32,6 +32,15 @@ public:
   void route();
 
 private:
+  struct RouteEnrty{
+    uint32_t route_prefix;
+    uint32_t prefix_length;
+    std::optional<Address> next_hop;
+    size_t interface_num;
+  };
+  std::vector<RouteEnrty> route_table_{};
+
+  // first i need to maintain a table of the 
   // The router's collection of network interfaces
   std::vector<std::shared_ptr<NetworkInterface>> interfaces_ {};
 };
